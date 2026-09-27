@@ -1,0 +1,32 @@
+apply plugin: 'java-library'
+
+sourceSets.main.java.srcDir 'src/main/java'
+sourceSets.test.java.srcDir 'src/test/java'
+
+repositories {
+    mavenLocal()
+    mavenCentral()
+}
+
+dependencies {
+    api project(':evcache-core')
+    api group:"io.zipkin.brave", name:"brave", version:"5.12.7"
+    testImplementation group:"org.testng", name:"testng", version:"7.5"
+    testImplementation group:"org.mockito", name:"mockito-all", version:"latest.release"
+}
+
+javadoc {
+    failOnError = false
+}
+
+test {
+    useTestNG()
+    jvmArgs += [
+            '--add-opens', 'java.base/java.lang=ALL-UNNAMED',
+            '--add-opens', 'java.base/java.lang.reflect=ALL-UNNAMED'
+    ]
+    minHeapSize = '1024m'
+    maxHeapSize = '1536m'
+    testLogging.displayGranularity = -1
+    testLogging.showStandardStreams = true
+}

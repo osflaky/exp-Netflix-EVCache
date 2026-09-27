@@ -1,0 +1,1075 @@
+package net.spy.memcached;
+
+import com.netflix.archaius.api.Property;
+import com.netflix.archaius.api.Property.Subscription;
+import com.netflix.archaius.api.PropertyRepository;
+import com.netflix.evcache.EVCacheGetOperationListener;
+import com.netflix.evcache.EVCacheLatch;
+import com.netflix.evcache.EVCacheTranscoder;
+import com.netflix.evcache.metrics.EVCacheMetricsFactory;
+import com.netflix.evcache.operation.EVCacheAsciiOperationFactory;
+import com.netflix.evcache.operation.EVCacheBulkGetFuture;
+import com.netflix.evcache.operation.EVCacheItem;
+import com.netflix.evcache.operation.EVCacheItemMetaData;
+import com.netflix.evcache.operation.EVCacheLatchImpl;
+import com.netflix.evcache.operation.EVCacheOperationFuture;
+import com.netflix.evcache.pool.EVCacheClient;
+import com.netflix.evcache.pool.EVCacheClientUtil;
+import com.netflix.evcache.pool.EVCacheValue;
+import com.netflix.evcache.util.EVCacheConfig;
+import com.netflix.spectator.api.BasicTag;
+import com.netflix.spectator.api.DistributionSummary;
+import com.netflix.spectator.api.Tag;
+import com.netflix.spectator.api.Timer;
+import java.io.IOException;
+import java.net.InetSocketAddress;
+import java.net.SocketAddress;
+import java.time.Duration;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.function.BiPredicate;
+import java.util.function.Consumer;
+import net.spy.memcached.internal.GetFuture;
+import net.spy.memcached.internal.OperationFuture;
+import net.spy.memcached.ops.ConcatenationType;
+import net.spy.memcached.ops.DeleteOperation;
+import net.spy.memcached.ops.GetAndTouchOperation;
+import net.spy.memcached.ops.GetOperation;
+import net.spy.memcached.ops.Mutator;
+import net.spy.memcached.ops.Operation;
+import net.spy.memcached.ops.OperationCallback;
+import net.spy.memcached.ops.OperationStatus;
+import net.spy.memcached.ops.StatusCode;
+import net.spy.memcached.ops.StoreOperation;
+import net.spy.memcached.ops.StoreType;
+import net.spy.memcached.protocol.ascii.ExecCmdOperation;
+import net.spy.memcached.protocol.ascii.MetaDebugOperation;
+import net.spy.memcached.protocol.ascii.MetaGetOperation;
+import net.spy.memcached.protocol.binary.BinaryOperationFactory;
+import net.spy.memcached.transcoders.Transcoder;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+@edu.umd.cs.findbugs.annotations.SuppressFBWarnings({ "PRMC_POSSIBLY_REDUNDANT_METHOD_CALLS",
+"SIC_INNER_SHOULD_BE_STATIC_ANON" })
+public class EVCacheMemcachedClient extends MemcachedClient {
+
+    private static final Logger log = LoggerFactory.getLogger(EVCacheMemcachedClient.class);
+    private final String appName;
+    private final Property<Integer> readTimeout;
+
+    private final EVCacheClient client;
+    private final Map<String, Timer> timerMap = new ConcurrentHashMap<String, Timer>();
+    private final Map<String, DistributionSummary> distributionSummaryMap = new ConcurrentHashMap<String, DistributionSummary>();
+
+    private Property<Long> mutateOperationTimeout;
+    private final ConnectionFactory connectionFactory;
+    private final Property<Integer> maxReadDuration, maxWriteDuration;
+    private final Property<Boolean> enableDebugLogsOnWrongKey;
+
+    private volatile boolean alwaysDecodeSync;
+    private final Subscription alwaysDecodeSyncSubscription;
+
+    public EVCacheMemcachedClient(ConnectionFactory cf, List<InetSocketAddress> addrs,
+                                  Property<Integer> readTimeout, EVCacheClient client) throws IOException {
+        super(cf, addrs);
+        this.connectionFactory = cf;
+        this.readTimeout = readTimeout;
+        this.client = client;
+        this.appName = client.getAppName();
+        final PropertyRepository props = EVCacheConfig.getInstance().getPropertyRepository();
+        this.maxWriteDuration = props.get(appName + ".max.write.duration.metric", Integer.class).orElseGet("evcache.max.write.duration.metric").orElse(50);
+        this.maxReadDuration = props.get(appName + ".max.read.duration.metric", Integer.class).orElseGet("evcache.max.read.duration.metric").orElse(20);
+        this.enableDebugLogsOnWrongKey = props.get(appName + ".enable.debug.logs.on.wrongkey", Boolean.class).orElse(false);
+
+        // TODO in future remove this flag so that decode does not block the IO loop
+        // the default/legacy behavior (true) is effectively to decode on the IO loop, set to false to use the transcode threads
+        Property<Boolean> alwaysDecodeSyncProperty = props
+                .get(appName + ".get.alwaysDecodeSync", Boolean.class)
+                .orElseGet("evcache.get.alwaysDecodeSync")
+                .orElse(true);
+        this.alwaysDecodeSync = alwaysDecodeSyncProperty.get();
+
+        // Subscription is maintained so that we can release the subscription on shutdown,
+        // otherwise it will retain a reference to this instance and prevent garbage collection.
+        this.alwaysDecodeSyncSubscription = alwaysDecodeSyncProperty.subscribe(v -> alwaysDecodeSync = v);
+    }
+
+    @Override
+    public boolean shutdown(long timeout, TimeUnit unit) {
+        try {
+            return super.shutdown(timeout, unit);
+        } finally {
+            if (alwaysDecodeSyncSubscription != null) {
+                alwaysDecodeSyncSubscription.unsubscribe();
+            }
+        }
+    }
+
+    public NodeLocator getNodeLocator() {
+        return this.mconn.getLocator();
+    }
+
+    public MemcachedNode getEVCacheNode(String key) {
+        return this.mconn.getLocator().getPrimary(key);
+    }
+
+    public <T> GetFuture<T> asyncGet(final String key, final Transcoder<T> tc) {
+        throw new UnsupportedOperationException("asyncGet");
+    }
+
+    // Returns 'true' if keys don't match and logs & reports the error.
+    // Returns 'false' if keys match.
+    // TODO: Consider removing this code once we've fixed the Wrong key bug(s)
+    private boolean isWrongKeyReturned(String original_key, String returned_key) {
+        if (!original_key.equals(returned_key)) {
+            // If they keys don't match, log the error along with the key owning host's information and stack trace.
+            final String original_host = getHostNameByKey(original_key);
+            final String returned_host = getHostNameByKey(returned_key);
+            log.error("Wrong key returned. Key - " + original_key + " (Host: " + original_host + ") ; Returned Key "
+                        + returned_key + " (Host: " + returned_host + ")", new Exception());
+            client.reportWrongKeyReturned();
+
+            // If we are configured to dynamically switch log levels to DEBUG on a wrong key error, do so here.
+            if (enableDebugLogsOnWrongKey.get()) {
+                System.setProperty("log4j.logger.net.spy.memcached", "DEBUG");
+            }
+            return true;
+        }
+        return false;
+    }
+
+    public <T> EVCacheOperationFuture<T> asyncGet(final String key, final Transcoder<T> tc, EVCacheGetOperationListener<T> listener) {
+        // we should only complete the latch when decode AND complete have completed
+        final CountDownLatch latch = new CountDownLatch(2);
+
+        final EVCacheOperationFuture<T> rv = new EVCacheOperationFuture<>(
+                key, latch, new AtomicReference<T>(null), readTimeout.get(), executorService, client);
+
+        final DistributionSummary dataSizeDS = getDataSizeDistributionSummary(
+                EVCacheMetricsFactory.GET_OPERATION,
+                EVCacheMetricsFactory.READ,
+                EVCacheMetricsFactory.IPC_SIZE_INBOUND);
+
+        @SuppressWarnings("unchecked")
+        final Transcoder<T> transcoder = (tc == null) ? (Transcoder<T>) getTranscoder() : tc;
+        final boolean shouldLog = log.isDebugEnabled() && client.getPool().getEVCacheClientPoolManager().shouldLog(appName);
+
+        final Operation op = opFact.get(key, new GetOperation.Callback() {
+            // not volatile since only ever used from memcached loop callbacks
+            private boolean asyncDecodeIssued = false;
+
+            // both volatile to ensure sync across transcode threads and memcached loop
+            private volatile T value;
+            private volatile OperationStatus status = null;
+
+            public void gotData(String k, int flags, byte[] data) {
+                if (isWrongKeyReturned(key, k)) {
+                    return;
+                }
+
+                if (shouldLog) {
+                    log.debug("Read data : key {}; flags : {}; data : {}", key, flags, data);
+                    if (data != null) {
+                        log.debug("Key : {}; val size : {}", key, data.length);
+                    } else {
+                        log.debug("Key : {}; val is null", key);
+                    }
+                }
+
+                if (data != null)  {
+                    dataSizeDS.record(data.length);
+
+                    if (tcService == null) {
+                        log.error("tcService is null, will not be able to decode");
+                        throw new RuntimeException("TranscoderSevice is null. Not able to decode");
+                    }
+
+                    CachedData chunk = new CachedData(flags, data, transcoder.getMaxSize());
+                    boolean doSync = alwaysDecodeSync || (!transcoder.asyncDecode(chunk));
+
+                    if (doSync) {
+                        value = transcoder.decode(chunk);
+                        rv.set(value, status);
+                    } else {
+                        asyncDecodeIssued = true;
+                        final Transcoder<T> wrappedTranscoder = decodeAndThen(transcoder, (decoded) -> {
+                            value = decoded;
+                            rv.set(decoded, status);
+                            latch.countDown();
+                        });
+                        tcService.decode(wrappedTranscoder, chunk);
+                    }
+                }
+            }
+
+            public void receivedStatus(OperationStatus status) {
+                this.status = status;
+
+                // On rare occasion, it might be possible that transcoder finishes and starts to call rv.set(),
+                // at the exact time that receivedStatus here does a set(). This means that through unlucky timing
+                // here we might drop the decoded value that was set by the transcoder.
+                //
+                // We add a simple if check to see if the transcode thread has changed the value after we did rv.set(),
+                // and if it has, we will do it again. Since value is only set once (after decode), we need only a single
+                // check here. It is important that it is a separate volatile read from value.
+
+                T before = value;
+                rv.set(before, status);
+                T after = value;
+
+                if (after != before) {
+                    rv.set(after, status);
+                }
+            }
+
+            public void complete() {
+                // if an async decode was never issued, issue an extra countdown, since 2 latch values were set
+                if (!asyncDecodeIssued) {
+                    latch.countDown();
+                }
+
+                latch.countDown();
+
+                final String metricHit = (asyncDecodeIssued || value != null) ? EVCacheMetricsFactory.YES : EVCacheMetricsFactory.NO;
+                final String host = ((rv.getStatus().getStatusCode().equals(StatusCode.TIMEDOUT) && rv.getOperation() != null) ? getHostName(rv.getOperation().getHandlingNode().getSocketAddress()) : null);
+                getTimer(EVCacheMetricsFactory.GET_OPERATION, EVCacheMetricsFactory.READ, rv.getStatus(), metricHit, host, getReadMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);
+                rv.signalComplete();
+            }
+        });
+        rv.setOperation(op);
+        if (listener != null) rv.addListener(listener);
+        mconn.enqueueOperation(key, op);
+        return rv;
+    }
+
+    // A Transcode wrapper to allow an action to be performed after decode has completed.
+    static <T> Transcoder<T> decodeAndThen(Transcoder<T> transcoder, Consumer<T> completed) {
+        return new Transcoder<T>() {
+            @Override
+            public boolean asyncDecode(CachedData d) {
+                return transcoder.asyncDecode(d);
+            }
+
+            @Override
+            public CachedData encode(T o) {
+                throw new UnsupportedOperationException("encode");
+            }
+
+            @Override
+            public T decode(CachedData d) {
+                T decoded = null;
+                try {
+                    decoded = transcoder.decode(d);
+                    return decoded;
+                } finally {
+                    completed.accept(decoded);
+                }
+            }
+
+            @Override
+            public int getMaxSize() {
+                return transcoder.getMaxSize();
+            }
+        };
+    }
+
+    /**
+     * Asynchronously retrieves multiple key-value pairs from memcached.
+     *
+     * @Deprecated This method does NOT support a mix of plain and hashed keys in {@code keys}, nor validation of read
+     * queue capacity. All keys are decoded exactly using the given transcoder (note that hashed keys require two step decoding).
+     * For supporting a mix of hashed and plain keys in the {@code keys} collection,
+     * use {@link #asyncGetBulk(Collection, Set, Transcoder, EVCacheTranscoder, BiPredicate, String, boolean, BiPredicate)}.
+     */
+    public <T> EVCacheBulkGetFuture<T> asyncGetBulk(Collection<String> keys,
+                                                    final Transcoder<T> tc,
+                                                    EVCacheGetOperationListener<T> listener) {
+        return asyncGetBulk(keys, tc, listener, (node, k) -> node.isActive());
+    }
+
+    /**
+     * Asynchronously retrieves multiple key-value pairs from memcached with node validation.
+     *
+     * @Deprecated This method does NOT support a mix of plain and hashed keys in {@code keys}. All keys are
+     * decoded exactly using the given transcoder (note that hashed keys require two step decoding).
+     * For supporting a mix of hashed and plain keys in the {@code keys} collection,
+     * use {@link #asyncGetBulk(Collection, Set, Transcoder, EVCacheTranscoder, BiPredicate, String, boolean, BiPredicate)}.
+     */
+
+    public <T> EVCacheBulkGetFuture<T> asyncGetBulk(Collection<String> keys,
+                                                    final Transcoder<T> tc,
+                                                    EVCacheGetOperationListener<T> listener,
+                                                    BiPredicate<MemcachedNode, String> nodeValidator) {
+        return asyncGetBulk(keys, null, tc, null, nodeValidator, null, false, null);
+    }
+
+    /**
+     * Asynchronously retrieves multiple key-value pairs from memcached with support for hashed keys and collision detection.
+     *
+     * <p>This method performs bulk retrieval of cached values and supports a two-step decoding process for hashed keys:
+     * <ol>
+     *   <li>Unhashed keys are decoded directly using the valueTranscoder</li>
+     *   <li>Hashed keys undergo two-step decoding:
+     *     <ul>
+     *       <li>First decoded with envelopeTranscoder to unwrap the {@link EVCacheValue} envelope</li>
+     *       <li>Then decoded with valueTranscoder to extract the actual data payload</li>
+     *       <li>Hash collision detection is performed during unwrapping</li>
+     *     </ul>
+     *   </li>
+     * </ol>
+     *
+     * <p>The method validates node availability and read queue sizes before dispatching operations.
+     * Results are returned asynchronously via {@link EVCacheBulkGetFuture}.
+     *
+     * @param <T> the type of values to be retrieved
+     * @param plainKeys collection of plain keys to get - this is a Collection for backwards compatibility
+     * @param hashedKeys set of hashed keys, separately from plain keys because they require two-step decoding; may be null if no hashed keys - this is a Set for O(1) lookups
+     * @param valueTranscoder transcoder for decoding the actual data payload
+     * @param envelopeTranscoder transcoder for unwrapping the EVCacheValue envelope (required for hashed keys); may be null if no hashed keys
+     * @param nodeValidator predicate to validate if a node should be queried for a given key
+     * @param appName application name for logging and metrics
+     * @param shouldLog flag indicating whether debug logging should be performed
+     * @param collisionChecker predicate that checks for hash collisions by comparing hashed key with decoded canonical key;
+     *                         returns true if collision detected, false otherwise; required for hashed keys
+     * @return a future that completes with a map of successfully retrieved key-value pairs
+     * @throws IllegalStateException if envelopeTranscoder is null when processing hashed keys, or if envelope decoding
+     *                               does not yield an EVCacheValue instance
+     * @throws RuntimeException if decoding with envelopeTranscoder fails
+     */
+    public <T> EVCacheBulkGetFuture<T> asyncGetBulk(Collection<String> plainKeys,
+                                                    Set<String> hashedKeys,
+                                                    final Transcoder<T> valueTranscoder,
+                                                    final EVCacheTranscoder envelopeTranscoder,
+                                                    BiPredicate<MemcachedNode, String> nodeValidator,
+                                                    String appName,
+                                                    boolean shouldLog,
+                                                    BiPredicate<String, String> collisionChecker) {
+        final Map<String, Future<T>> m = new ConcurrentHashMap<>();
+
+        // Break the gets down into groups by key
+        final Map<MemcachedNode, Collection<String>> chunks = new HashMap<>();
+        final NodeLocator locator = mconn.getLocator();
+
+        //Populate Node and key Map (from both plain and hashed key collections)
+        Iterator<String> iter1 = plainKeys != null ? plainKeys.iterator() : Collections.emptyIterator();
+        Iterator<String> iter2 = hashedKeys != null ? hashedKeys.iterator() : Collections.emptyIterator();
+        int plainKeysSize = plainKeys != null ? plainKeys.size() : 0;
+        int hashedKeysSize = hashedKeys != null ? hashedKeys.size() : 0;
+
+        while (iter1.hasNext() || iter2.hasNext()) {
+            String key = iter1.hasNext() ? iter1.next() : iter2.next();
+            EVCacheClientUtil.validateKey(key, opFact instanceof BinaryOperationFactory);
+            final MemcachedNode primaryNode = locator.getPrimary(key);
+            if (nodeValidator.test(primaryNode, key)) {
+                Collection<String> ks = chunks.computeIfAbsent(primaryNode, k -> new ArrayList<>());
+                ks.add(key);
+            }
+        }
+
+        final AtomicInteger pendingChunks = new AtomicInteger(chunks.size());
+        int initialLatchCount = chunks.isEmpty() ? 0 : 1;
+        final CountDownLatch latch = new CountDownLatch(initialLatchCount);
+        final Collection<Operation> ops = new ArrayList<Operation>(chunks.size());
+        final EVCacheBulkGetFuture<T> rv = new EVCacheBulkGetFuture<T>(m, ops, latch, executorService, client);
+        rv.setExpectedCount(chunks.size());
+
+        final DistributionSummary dataSizeDS = getDataSizeDistributionSummary(
+                        EVCacheMetricsFactory.BULK_OPERATION,
+                        EVCacheMetricsFactory.READ,
+                        EVCacheMetricsFactory.IPC_SIZE_INBOUND);
+
+        class EVCacheBulkGetSingleFutureCallback implements GetOperation.Callback {
+            final int thisOpId;
+            GetOperation op = null;
+            public EVCacheBulkGetSingleFutureCallback(int thisOpId) {
+                this.thisOpId = thisOpId;
+            }
+
+            void bindOp(GetOperation op) {
+                assert this.op == null;
+                assert op != null;
+
+                this.op = op;
+            }
+
+            @Override
+            public void receivedStatus(OperationStatus status) {
+                if (log.isDebugEnabled()) log.debug("GetBulk Keys : plain[" + plainKeys + "], hashed [" + hashedKeys +
+                        "]; Status : " + status.getStatusCode().name() + "; Message : " + status.getMessage() + "; Elapsed Time - " + (System.currentTimeMillis() - rv.getStartTime()));
+                rv.setStatus(status);
+            }
+
+            @Override
+            public void gotData(String k, int flags, byte[] data) {
+                if (data != null)  {
+                    dataSizeDS.record(data.length);
+                }
+
+                if (hashedKeys != null && hashedKeys.contains(k)) {
+                    // hashed keys require 2 step decoding, first using envelopeTranscoder then using valueTranscoder
+                    if (envelopeTranscoder == null) throw new IllegalStateException("Both transcoders required for 2-step decode, failed on key " + k
+                            + " of bulk get for plain keys [" + plainKeys + "] and hashed keys [" + hashedKeys + "]");
+
+                    Object obj;
+                    try {
+                        obj = envelopeTranscoder.decode(new CachedData(flags, data, envelopeTranscoder.getMaxSize()));
+                    } catch (Exception e) {
+                        throw new RuntimeException("Failed to decode key " + k + " using envelopeTranscoder " + envelopeTranscoder.getClass().getName(), e);
+                    }
+                    if (obj instanceof EVCacheValue) {
+                        if (log.isDebugEnabled() && shouldLog)
+                            log.debug("APP " + appName + ", The value for key [" + k + "] is EVCache Value");
+                        final EVCacheValue val = (EVCacheValue) obj;
+                        boolean collision = collisionChecker.test(k, val.getKey());
+                        if (!collision) {
+                            m.put(k, tcService.decode(valueTranscoder, new CachedData(val.getFlags(), val.getValue(), valueTranscoder.getMaxSize())));
+                        }
+                    } else {
+                        // This can occur when a hashed key xyz and a raw key also xyz are in the bulk request. envelopeTranscoder would attempt to
+                        // decode, only to find that an instance of EVCacheValue was not returned
+                        if (log.isDebugEnabled() && shouldLog)
+                            log.debug("Applying envelopeTranscoder to hashed key {} did not yield an instance of EVCacheValue, this could be due to collision", k);
+
+                    }
+                } else {
+                    // un hashed keys require this single step decode
+                    m.put(k, tcService.decode(valueTranscoder, new CachedData(flags, data, valueTranscoder.getMaxSize())));
+                }
+            }
+
+            @Override
+            public void complete() {
+                assert op != null;
+
+                rv.signalSingleOpComplete(thisOpId, op);
+                if (pendingChunks.decrementAndGet() <= 0) {
+                    latch.countDown();
+                    getTimer(EVCacheMetricsFactory.BULK_OPERATION, EVCacheMetricsFactory.READ, rv.getStatus(), (m.size() == (plainKeysSize + hashedKeysSize) ? EVCacheMetricsFactory.YES : EVCacheMetricsFactory.NO), null, getReadMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);
+                    rv.signalComplete();
+                }
+            }
+        };
+
+        // Now that we know how many servers it breaks down into, and the latch
+        // is all set up, convert all of these strings collections to operations
+        final Map<MemcachedNode, Operation> mops = new HashMap<MemcachedNode, Operation>();
+        int thisOpId = 0;
+        for (Map.Entry<MemcachedNode, Collection<String>> me : chunks.entrySet()) {
+            EVCacheBulkGetSingleFutureCallback cb = new EVCacheBulkGetSingleFutureCallback(thisOpId);
+            GetOperation op = opFact.get(me.getValue(), cb);
+            cb.bindOp(op);
+            mops.put(me.getKey(), op);
+            ops.add(op);
+            thisOpId++;
+        }
+        assert mops.size() == chunks.size();
+        mconn.checkState();
+        mconn.addOperations(mops);
+        return rv;
+    }
+
+    public <T> EVCacheOperationFuture<CASValue<T>> asyncGetAndTouch(final String key, final int exp, final Transcoder<T> tc) {
+        final CountDownLatch latch = new CountDownLatch(1);
+        final EVCacheOperationFuture<CASValue<T>> rv = new EVCacheOperationFuture<CASValue<T>>(key, latch, new AtomicReference<CASValue<T>>(null), operationTimeout, executorService, client);
+        Operation op = opFact.getAndTouch(key, exp, new GetAndTouchOperation.Callback() {
+            private CASValue<T> val = null;
+
+            public void receivedStatus(OperationStatus status) {
+                if (log.isDebugEnabled()) log.debug("GetAndTouch Key : " + key + "; Status : " + status.getStatusCode().name()
+                        + (log.isTraceEnabled() ?  " Node : " + getEVCacheNode(key) : "")
+                        + "; Message : " + status.getMessage() + "; Elapsed Time - " + (System.currentTimeMillis() - rv.getStartTime()));
+                rv.set(val, status);
+            }
+
+            public void complete() {
+                latch.countDown();
+                final String host = ((rv.getStatus().getStatusCode().equals(StatusCode.TIMEDOUT) && rv.getOperation() != null) ? getHostName(rv.getOperation().getHandlingNode().getSocketAddress()) : null);
+                getTimer(EVCacheMetricsFactory.GET_AND_TOUCH_OPERATION, EVCacheMetricsFactory.READ, rv.getStatus(), (val != null ? EVCacheMetricsFactory.YES : EVCacheMetricsFactory.NO), host, getReadMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);
+                rv.signalComplete();
+            }
+
+            public void gotData(String k, int flags, long cas, byte[] data) {
+                if (isWrongKeyReturned(key, k)) return;
+
+                if (data != null) getDataSizeDistributionSummary(EVCacheMetricsFactory.GET_AND_TOUCH_OPERATION, EVCacheMetricsFactory.READ, EVCacheMetricsFactory.IPC_SIZE_INBOUND).record(data.length);
+                val = new CASValue<T>(cas, tc.decode(new CachedData(flags, data, tc.getMaxSize())));
+            }
+        });
+        rv.setOperation(op);
+        mconn.enqueueOperation(key, op);
+        return rv;
+    }
+
+    public <T> OperationFuture<Boolean> set(String key, int exp, T o, final Transcoder<T> tc) {
+        return asyncStore(StoreType.set, key, exp, o, tc, null);
+    }
+
+    public OperationFuture<Boolean> set(String key, int exp, Object o) {
+        return asyncStore(StoreType.set, key, exp, o, transcoder, null);
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> OperationFuture<Boolean> set(String key, int exp, T o, final Transcoder<T> tc, EVCacheLatch latch) {
+        Transcoder<T> t = (Transcoder<T>) ((tc == null) ? transcoder : tc);
+        return asyncStore(StoreType.set, key, exp, o, t, latch);
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> OperationFuture<Boolean> replace(String key, int exp, T o, final Transcoder<T> tc, EVCacheLatch latch) {
+        Transcoder<T> t = (Transcoder<T>) ((tc == null) ? transcoder : tc);
+        return asyncStore(StoreType.replace, key, exp, o, t, latch);
+    }
+
+    public <T> OperationFuture<Boolean> add(String key, int exp, T o, Transcoder<T> tc) {
+        return asyncStore(StoreType.add, key, exp, o, tc, null);
+    }
+
+    public OperationFuture<Boolean> delete(String key, EVCacheLatch evcacheLatch) {
+        final CountDownLatch latch = new CountDownLatch(1);
+        final EVCacheOperationFuture<Boolean> rv = new EVCacheOperationFuture<Boolean>(key, latch, new AtomicReference<Boolean>(null), operationTimeout, executorService, client);
+        final DeleteOperation op = opFact.delete(key, new DeleteOperation.Callback() {
+            @Override
+            public void receivedStatus(OperationStatus status) {
+                rv.set(Boolean.TRUE, status);
+            }
+
+            @Override
+            public void gotData(long cas) {
+                rv.setCas(cas);
+            }
+
+            @Override
+            public void complete() {
+                latch.countDown();
+                final String host = ((rv.getStatus().getStatusCode().equals(StatusCode.TIMEDOUT) && rv.getOperation() != null) ? getHostName(rv.getOperation().getHandlingNode().getSocketAddress()) : null);
+                getTimer(EVCacheMetricsFactory.DELETE_OPERATION, EVCacheMetricsFactory.WRITE, rv.getStatus(), null, host, getWriteMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);
+                rv.signalComplete();
+            }
+        });
+
+        rv.setOperation(op);
+        if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl && !client.isInWriteOnly()) ((EVCacheLatchImpl) evcacheLatch).addFuture(rv);
+        mconn.enqueueOperation(key, op);
+        return rv;
+    }
+
+    public <T> OperationFuture<Boolean> touch(final String key, final int exp, EVCacheLatch evcacheLatch) {
+        final CountDownLatch latch = new CountDownLatch(1);
+        final EVCacheOperationFuture<Boolean> rv = new EVCacheOperationFuture<Boolean>(key, latch, new AtomicReference<Boolean>(null), operationTimeout, executorService, client);
+        final Operation op = opFact.touch(key, exp, new OperationCallback() {
+            @Override
+            public void receivedStatus(OperationStatus status) {
+                rv.set(status.isSuccess(), status);
+            }
+
+            @Override
+            public void complete() {
+                latch.countDown();
+                final String host = ((rv.getStatus().getStatusCode().equals(StatusCode.TIMEDOUT) && rv.getOperation() != null) ? getHostName(rv.getOperation().getHandlingNode().getSocketAddress()) : null);
+                getTimer(EVCacheMetricsFactory.TOUCH_OPERATION, EVCacheMetricsFactory.WRITE, rv.getStatus(), null, host, getWriteMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);
+                rv.signalComplete();
+            }
+        });
+        rv.setOperation(op);
+        if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl && !client.isInWriteOnly()) ((EVCacheLatchImpl) evcacheLatch).addFuture(rv);
+        mconn.enqueueOperation(key, op);
+        return rv;
+    }
+
+
+    public <T> OperationFuture<Boolean> asyncAppendOrAdd(final String key, int exp, CachedData co, EVCacheLatch evcacheLatch) {
+        final CountDownLatch latch = new CountDownLatch(1);
+        if(co != null && co.getData() != null) getDataSizeDistributionSummary(EVCacheMetricsFactory.AOA_OPERATION, EVCacheMetricsFactory.WRITE, EVCacheMetricsFactory.IPC_SIZE_OUTBOUND).record(co.getData().length);
+        final EVCacheOperationFuture<Boolean> rv = new EVCacheOperationFuture<Boolean>(key, latch, new AtomicReference<Boolean>(null), operationTimeout, executorService, client);
+        final Operation opAppend = opFact.cat(ConcatenationType.append, 0, key, co.getData(), new OperationCallback() {
+            boolean appendSuccess = false;
+            @Override
+            public void receivedStatus(OperationStatus val) {
+                if (log.isDebugEnabled() && client.getPool().getEVCacheClientPoolManager().shouldLog(appName)) log.debug("AddOrAppend Key (Append Operation): " + key + "; Status : " + val.getStatusCode().name()
+                        + "; Message : " + val.getMessage() + "; Elapsed Time - " + (System.currentTimeMillis() - rv.getStartTime()));
+                if (val.getStatusCode().equals(StatusCode.SUCCESS)) {
+                    rv.set(Boolean.TRUE, val);
+                    appendSuccess = true;
+
+                }
+            }
+
+            @Override
+            public void complete() {
+                if(appendSuccess)  {
+                    final String host = ((rv.getStatus().getStatusCode().equals(StatusCode.TIMEDOUT) && rv.getOperation() != null) ? getHostName(rv.getOperation().getHandlingNode().getSocketAddress()) : null);
+                    getTimer(EVCacheMetricsFactory.AOA_OPERATION_APPEND, EVCacheMetricsFactory.WRITE, rv.getStatus(), EVCacheMetricsFactory.YES, host, getWriteMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);;
+                    latch.countDown();
+                    rv.signalComplete();
+                } else {
+                    Operation opAdd = opFact.store(StoreType.add, key, co.getFlags(), exp, co.getData(), new StoreOperation.Callback() {
+                        @Override
+                        public void receivedStatus(OperationStatus addStatus) {
+                            if (log.isDebugEnabled() && client.getPool().getEVCacheClientPoolManager().shouldLog(appName)) log.debug("AddOrAppend Key (Add Operation): " + key + "; Status : " + addStatus.getStatusCode().name()
+                                    + "; Message : " + addStatus.getMessage() + "; Elapsed Time - " + (System.currentTimeMillis() - rv.getStartTime()));
+                            if(addStatus.isSuccess()) {
+                                appendSuccess = true;
+                                rv.set(addStatus.isSuccess(), addStatus);
+                            } else {
+                                Operation opReappend = opFact.cat(ConcatenationType.append, 0, key, co.getData(), new OperationCallback() {
+                                    public void receivedStatus(OperationStatus retryAppendStatus) {
+                                        if (retryAppendStatus.getStatusCode().equals(StatusCode.SUCCESS)) {
+                                            rv.set(Boolean.TRUE, retryAppendStatus);
+                                            if (log.isDebugEnabled()) log.debug("AddOrAppend Retry append Key (Append Operation): " + key + "; Status : " + retryAppendStatus.getStatusCode().name()
+                                                    + "; Message : " + retryAppendStatus.getMessage() + "; Elapsed Time - " + (System.currentTimeMillis() - rv.getStartTime()));
+                                        } else {
+                                            rv.set(Boolean.FALSE, retryAppendStatus);
+                                        }
+                                    }
+                                    public void complete() {
+                                        final String host = ((rv.getStatus().getStatusCode().equals(StatusCode.TIMEDOUT) && rv.getOperation() != null) ? getHostName(rv.getOperation().getHandlingNode().getSocketAddress()) : null);
+                                        getTimer(EVCacheMetricsFactory.AOA_OPERATION_REAPPEND, EVCacheMetricsFactory.WRITE, rv.getStatus(), EVCacheMetricsFactory.YES, host, getWriteMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);
+                                        latch.countDown();
+                                        rv.signalComplete();
+                                    }
+                                });
+                                rv.setOperation(opReappend);
+                                mconn.enqueueOperation(key, opReappend);
+                            }
+                        }
+
+                        @Override
+                        public void gotData(String key, long cas) {
+                            rv.setCas(cas);
+                        }
+
+                        @Override
+                        public void complete() {
+                            if(appendSuccess) {
+                                final String host = ((rv.getStatus().getStatusCode().equals(StatusCode.TIMEDOUT) && rv.getOperation() != null) ? getHostName(rv.getOperation().getHandlingNode().getSocketAddress()) : null);
+                                getTimer(EVCacheMetricsFactory.AOA_OPERATION_ADD, EVCacheMetricsFactory.WRITE, rv.getStatus(), EVCacheMetricsFactory.YES, host, getWriteMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);
+                                latch.countDown();
+                                rv.signalComplete();
+                            }
+                        }
+                    });
+                    rv.setOperation(opAdd);
+                    mconn.enqueueOperation(key, opAdd);
+                }
+            }
+        });
+        rv.setOperation(opAppend);
+        mconn.enqueueOperation(key, opAppend);
+        if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl && !client.isInWriteOnly()) ((EVCacheLatchImpl) evcacheLatch).addFuture(rv);
+        return rv;
+    }
+
+    private String operationSuccessOrFail(OperationStatus status) {
+        if(status == null) {
+            return null;
+        }
+        if(status.getStatusCode() == StatusCode.SUCCESS || status.getStatusCode() == StatusCode.ERR_NOT_FOUND || status.getStatusCode() == StatusCode.ERR_EXISTS) {
+            return EVCacheMetricsFactory.SUCCESS;
+        }
+        return EVCacheMetricsFactory.FAIL;
+    }
+
+    private Timer getTimer(String operation, String operationType, OperationStatus status, String hit, String host, long maxDuration) {
+
+        StringBuilder sb = new StringBuilder(32);
+        sb.append(operation);
+        if(operationType != null) sb.append(operationType);
+        if(status != null) sb.append(operationSuccessOrFail(status));
+        if(status != null) sb.append(status.getStatusCode().name());
+        if(hit != null) sb.append(hit);
+        if(host != null) sb.append(host);
+        String name = sb.toString();
+
+        Timer timer = timerMap.get(name);
+        if(timer != null) return timer;
+
+        final List<Tag> tagList = new ArrayList<Tag>(client.getTagList().size() + 4 + (host == null ? 0 : 1));
+        tagList.addAll(client.getTagList());
+        if(operation != null) tagList.add(new BasicTag(EVCacheMetricsFactory.CALL_TAG, operation));
+        if(operationType != null) tagList.add(new BasicTag(EVCacheMetricsFactory.CALL_TYPE_TAG, operationType));
+        if(status != null) {
+            tagList.add(new BasicTag(EVCacheMetricsFactory.IPC_RESULT, operationSuccessOrFail(status)));
+            tagList.add(new BasicTag(EVCacheMetricsFactory.IPC_STATUS, getStatusCode(status.getStatusCode())));
+        }
+        if(hit != null) tagList.add(new BasicTag(EVCacheMetricsFactory.CACHE_HIT, hit));
+        if(host != null) tagList.add(new BasicTag(EVCacheMetricsFactory.FAILED_HOST, host));
+
+        timer = EVCacheMetricsFactory.getInstance().getPercentileTimer(EVCacheMetricsFactory.IPC_CALL, tagList, Duration.ofMillis(maxDuration));
+        timerMap.put(name, timer);
+        return timer;
+    }
+    
+    private String getStatusCode(StatusCode sc) {
+        return EVCacheMetricsFactory.getInstance().getStatusCode(sc);
+    }
+
+    private DistributionSummary getDataSizeDistributionSummary(String operation, String type, String metric) {
+        DistributionSummary distributionSummary = distributionSummaryMap.get(operation);
+        if(distributionSummary != null) return distributionSummary;
+
+        final List<Tag> tagList = new ArrayList<Tag>(6);
+        tagList.addAll(client.getTagList());
+        tagList.add(new BasicTag(EVCacheMetricsFactory.CALL_TAG, operation));
+        tagList.add(new BasicTag(EVCacheMetricsFactory.CALL_TYPE_TAG, type));
+        distributionSummary = EVCacheMetricsFactory.getInstance().getDistributionSummary(metric, tagList);
+        distributionSummaryMap.put(operation, distributionSummary);
+        return distributionSummary;
+    }
+
+    private <T> OperationFuture<Boolean> asyncStore(final StoreType storeType, final String key, int exp, T value, Transcoder<T> tc, EVCacheLatch evcacheLatch) {
+        final CachedData co;
+        if (value instanceof CachedData) {
+            co = (CachedData) value;
+        } else {
+            co = tc.encode(value);
+        }
+        final CountDownLatch latch = new CountDownLatch(1);
+        final String operationStr;
+        if (storeType == StoreType.set) {
+            operationStr = EVCacheMetricsFactory.SET_OPERATION;
+        } else if (storeType == StoreType.add) {
+            operationStr = EVCacheMetricsFactory.ADD_OPERATION;
+        } else {
+            operationStr = EVCacheMetricsFactory.REPLACE_OPERATION;
+        }
+        if(co != null && co.getData() != null) getDataSizeDistributionSummary(operationStr, EVCacheMetricsFactory.WRITE, EVCacheMetricsFactory.IPC_SIZE_OUTBOUND).record(co.getData().length);
+
+        final EVCacheOperationFuture<Boolean> rv = new EVCacheOperationFuture<Boolean>(key, latch, new AtomicReference<Boolean>(null), operationTimeout, executorService, client);
+        final Operation op = opFact.store(storeType, key, co.getFlags(), exp, co.getData(), new StoreOperation.Callback() {
+            @Override
+            public void receivedStatus(OperationStatus val) {
+                if (log.isDebugEnabled()) log.debug("Storing Key : " + key + "; Status : " + val.getStatusCode().name() + (log.isTraceEnabled() ?  " Node : " + getEVCacheNode(key) : "") + "; Message : " + val.getMessage()
+                + "; Elapsed Time - " + (System.currentTimeMillis() - rv.getStartTime()));
+                rv.set(val.isSuccess(), val);
+                if (log.isTraceEnabled() && !val.getStatusCode().equals(StatusCode.SUCCESS)) log.trace(val.getStatusCode().name() + " storing Key : " + key , new Exception());
+            }
+
+            @Override
+            public void gotData(String key, long cas) {
+                rv.setCas(cas);
+            }
+
+            @Override
+            public void complete() {
+                latch.countDown();
+                final String host = (((rv.getStatus().getStatusCode().equals(StatusCode.TIMEDOUT) || rv.getStatus().getStatusCode().equals(StatusCode.ERR_NO_MEM)) && rv.getOperation() != null) ? getHostName(rv.getOperation().getHandlingNode().getSocketAddress()) : null);
+                getTimer(operationStr, EVCacheMetricsFactory.WRITE, rv.getStatus(), null, host, getWriteMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);
+                rv.signalComplete();
+            }
+        });
+        rv.setOperation(op);
+        if (evcacheLatch != null && evcacheLatch instanceof EVCacheLatchImpl && !client.isInWriteOnly()) ((EVCacheLatchImpl) evcacheLatch).addFuture(rv);
+        mconn.enqueueOperation(key, op);
+        return rv;
+    }
+
+    public String toString() {
+        return appName + "-" + client.getZone() + "-" + client.getId();
+    }
+
+    @SuppressWarnings("unchecked")
+    public <T> OperationFuture<Boolean> add(String key, int exp, T o, final Transcoder<T> tc, EVCacheLatch latch) {
+        Transcoder<T> t = (Transcoder<T>) ((tc == null) ? transcoder : tc);
+        return asyncStore(StoreType.add, key, exp, o, t, latch);
+    }
+
+    public long incr(String key, long by, long def, int exp) {
+        return mutate(Mutator.incr, key, by, def, exp);
+    }
+
+
+    public long decr(String key, long by, long def, int exp) {
+        return mutate(Mutator.decr, key, by, def, exp);
+    }
+
+    public long mutate(final Mutator m, String key, long by, long def, int exp) {
+        final String operationStr = m.name();
+        final long start = System.currentTimeMillis();
+        final AtomicLong rv = new AtomicLong();
+        final CountDownLatch latch = new CountDownLatch(1);
+        final List<OperationStatus> statusList = new ArrayList<OperationStatus>(1);
+        final Operation op = opFact.mutate(m, key, by, def, exp, new OperationCallback() {
+            @Override
+            public void receivedStatus(OperationStatus s) {
+                statusList.add(s);
+                rv.set(new Long(s.isSuccess() ? s.getMessage() : "-1"));
+            }
+
+            @Override
+            public void complete() {
+                latch.countDown();
+            }
+        });
+        mconn.enqueueOperation(key, op);
+        long retVal = def;
+        try {
+            if(mutateOperationTimeout == null) {
+                mutateOperationTimeout = EVCacheConfig.getInstance().getPropertyRepository().get(appName + ".mutate.timeout", Long.class).orElse(connectionFactory.getOperationTimeout());
+            }
+
+
+            if (!latch.await(mutateOperationTimeout.get(), TimeUnit.MILLISECONDS)) {
+                if (log.isDebugEnabled()) log.debug("Mutation operation timeout. Will return -1");
+                retVal = -1;
+            } else {
+                retVal = rv.get();
+            }
+
+        } catch (Exception e) {
+            log.error("Exception on mutate operation : " + operationStr + " Key : " + key + "; by : " + by + "; default : " + def + "; exp : " + exp
+                    + "; val : " + retVal + "; Elapsed Time - " + (System.currentTimeMillis() - start), e);
+
+        }
+        final OperationStatus status = statusList.size() > 0 ? statusList.get(0) : null;
+        final String host = ((status != null && status.getStatusCode().equals(StatusCode.TIMEDOUT) && op != null) ? getHostName(op.getHandlingNode().getSocketAddress()) : null);
+        getTimer(operationStr, EVCacheMetricsFactory.WRITE, status, null, host, getWriteMetricMaxValue()).record((System.currentTimeMillis() - start), TimeUnit.MILLISECONDS);
+        if (log.isDebugEnabled() && client.getPool().getEVCacheClientPoolManager().shouldLog(appName)) log.debug(operationStr + " Key : " + key + "; by : " + by + "; default : " + def + "; exp : " + exp
+                + "; val : " + retVal + "; Elapsed Time - " + (System.currentTimeMillis() - start));
+        return retVal;
+    }
+
+    public void reconnectNode(EVCacheNode evcNode ) {
+        final long upTime = System.currentTimeMillis() - evcNode.getCreateTime();
+        if (log.isDebugEnabled()) log.debug("Reconnecting node : " + evcNode + "; UpTime : " + upTime);
+        if(upTime > 30000) { //not more than once every 30 seconds : TODO make this configurable
+            final List<Tag> tagList = new ArrayList<Tag>(client.getTagList().size() + 2);
+            tagList.addAll(client.getTagList());
+            tagList.add(new BasicTag(EVCacheMetricsFactory.CONFIG_NAME, EVCacheMetricsFactory.RECONNECT));
+            tagList.add(new BasicTag(EVCacheMetricsFactory.FAILED_HOST, evcNode.getHostName()));
+            EVCacheMetricsFactory.getInstance().increment(EVCacheMetricsFactory.CONFIG, tagList);
+            evcNode.setConnectTime(System.currentTimeMillis());
+            mconn.queueReconnect(evcNode);
+        }
+    }
+
+    public int getWriteMetricMaxValue() {
+        return maxWriteDuration.get().intValue();
+    }
+
+    public int getReadMetricMaxValue() {
+        return maxReadDuration.get().intValue();
+    }
+
+    private String getHostNameByKey(String key) {
+        MemcachedNode evcNode = getEVCacheNode(key);
+        return getHostName(evcNode.getSocketAddress());
+    }
+
+    private String getHostName(SocketAddress sa) {
+        if (sa == null) return null;
+        if(sa instanceof InetSocketAddress) {
+            return ((InetSocketAddress)sa).getHostName();
+        } else {
+            return sa.toString();
+        }
+    }
+
+    public EVCacheItemMetaData metaDebug(String key) {
+        final CountDownLatch latch = new CountDownLatch(1);
+        final EVCacheItemMetaData rv = new EVCacheItemMetaData();
+        if(opFact instanceof EVCacheAsciiOperationFactory) {
+        final Operation op = ((EVCacheAsciiOperationFactory)opFact).metaDebug(key, new MetaDebugOperation.Callback() {
+            public void receivedStatus(OperationStatus status) {
+                if (!status.isSuccess()) {
+                    if (log.isDebugEnabled()) log.debug("Unsuccessful stat fetch: %s", status);
+                  }
+                if (log.isDebugEnabled()) log.debug("Getting Meta Debug: " + key + "; Status : " + status.getStatusCode().name() + (log.isTraceEnabled() ?  " Node : " + getEVCacheNode(key) : "") + "; Message : " + status.getMessage());
+            }
+
+            public void debugInfo(String k, String val) {
+                if (log.isDebugEnabled()) log.debug("key " + k + "; val : " + val);
+                if(k.equals("exp")) rv.setSecondsLeftToExpire(Long.parseLong(val) * -1);
+                else if(k.equals("la")) rv.setSecondsSinceLastAccess(Long.parseLong(val));
+                else if(k.equals("cas")) rv.setCas(Long.parseLong(val));
+                else if(k.equals("fetch")) rv.setHasBeenFetchedAfterWrite(Boolean.parseBoolean(val));
+                else if(k.equals("cls")) rv.setSlabClass(Integer.parseInt(val));
+                else if(k.equals("size")) rv.setSizeInBytes(Integer.parseInt(val));
+            }
+
+            public void complete() {
+                latch.countDown();
+            }});
+            mconn.enqueueOperation(key, op);
+            try {
+                if (!latch.await(operationTimeout, TimeUnit.MILLISECONDS)) {
+                    if (log.isDebugEnabled()) log.debug("meta debug operation timeout. Will return empty opbject.");
+                }
+            } catch (Exception e) {
+                log.error("Exception on meta debug operation : Key : " + key, e);
+            }
+            if (log.isDebugEnabled()) log.debug("Meta Debug Data : " + rv);
+        }
+        return rv;
+    }
+
+    public Map<SocketAddress, String> execCmd(final String cmd, String[] ips) {
+        final Map<SocketAddress, String> rv = new HashMap<SocketAddress, String>();
+        Collection<MemcachedNode> nodes = null;
+        if(ips == null || ips.length == 0) {
+            nodes = mconn.getLocator().getAll();
+        } else {
+            nodes = new ArrayList<MemcachedNode>(ips.length);
+            for(String ip : ips) {
+                for(MemcachedNode node : mconn.getLocator().getAll()) {
+                    if(((InetSocketAddress)node.getSocketAddress()).getAddress().getHostAddress().equals(ip)) {
+                        nodes.add(node);
+                    }
+                }
+            }
+        }
+        if(nodes != null && !nodes.isEmpty()) {
+            CountDownLatch blatch = broadcastOp(new BroadcastOpFactory() {
+                @Override
+                public Operation newOp(final MemcachedNode n, final CountDownLatch latch) {
+                    final SocketAddress sa = n.getSocketAddress();
+                    return ((EVCacheAsciiOperationFactory)opFact).execCmd(cmd, new ExecCmdOperation.Callback() {
+    
+                        @Override
+                        public void receivedStatus(OperationStatus status) {
+                            if (log.isDebugEnabled()) log.debug("cmd : " + cmd + "; MemcachedNode : " + n + "; Status : " + status);
+                            rv.put(sa, status.getMessage());
+                        }
+    
+                        @Override
+                        public void complete() {
+                            latch.countDown();
+                        }
+                    });
+                }
+            }, nodes);
+            try {
+                blatch.await(operationTimeout, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                throw new RuntimeException("Interrupted waiting for stats", e);
+            }
+        }
+        return rv;
+    }
+
+    public <T> EVCacheOperationFuture<EVCacheItem<T>> asyncMetaGet(final String key, final Transcoder<T> tc, EVCacheGetOperationListener<T> listener) {
+        final CountDownLatch latch = new CountDownLatch(1);
+
+        final EVCacheOperationFuture<EVCacheItem<T>> rv = new EVCacheOperationFuture<EVCacheItem<T>>(key, latch, new AtomicReference<EVCacheItem<T>>(null), readTimeout.get().intValue(), executorService, client);
+        if(opFact instanceof EVCacheAsciiOperationFactory) {
+        final Operation op = ((EVCacheAsciiOperationFactory)opFact).metaGet(key, new MetaGetOperation.Callback() {
+
+            private EVCacheItem<T> evItem = new EVCacheItem<T>();
+
+            public void receivedStatus(OperationStatus status) {
+                if (log.isDebugEnabled()) log.debug("Getting Key : " + key + "; Status : " + status.getStatusCode().name() + (log.isTraceEnabled() ?  " Node : " + getEVCacheNode(key) : "")
+                        + "; Message : " + status.getMessage() + "; Elapsed Time - " + (System.currentTimeMillis() - rv.getStartTime()));
+                try {
+                    if (evItem.getData() != null) {
+                        if (log.isTraceEnabled() && client.getPool().getEVCacheClientPoolManager().shouldLog(appName)) log.trace("Key : " + key + "; val : " + evItem);
+                        rv.set(evItem, status);
+                    } else {
+                        if (log.isTraceEnabled() && client.getPool().getEVCacheClientPoolManager().shouldLog(appName)) log.trace("Key : " + key + "; val is null");
+                        rv.set(null, status);
+                    }
+                } catch (Exception e) {
+                    log.error(e.getMessage(), e);
+                    rv.set(null, status);
+                }
+            }
+
+            @Override
+            public void gotMetaData(String k, char flag, String fVal) {
+                if (log.isDebugEnabled()) log.debug("key " + k + "; val : " + fVal + "; flag : " + flag);
+                if (isWrongKeyReturned(key, k)) return;
+
+                switch (flag) {
+                case 's':
+                    evItem.getItemMetaData().setSizeInBytes(Integer.parseInt(fVal));
+                    break;
+
+                case 'c':
+                    evItem.getItemMetaData().setCas(Long.parseLong(fVal));
+                    break;
+
+                case 'f':
+                    evItem.setFlag(Integer.parseInt(fVal));
+                    break;
+
+                case 'h':
+                    evItem.getItemMetaData().setHasBeenFetchedAfterWrite(fVal.equals("1"));
+                    break;
+
+                case 'l':
+                    evItem.getItemMetaData().setSecondsSinceLastAccess(Long.parseLong(fVal));
+                    break;
+
+                case 'O':
+                    //opaque = val;
+                    break;
+
+                case 't':
+                    final int ttlLeft = Integer.parseInt(fVal);
+                    evItem.getItemMetaData().setSecondsLeftToExpire(ttlLeft);
+                    getDataSizeDistributionSummary(EVCacheMetricsFactory.META_GET_OPERATION, EVCacheMetricsFactory.READ, EVCacheMetricsFactory.INTERNAL_TTL).record(ttlLeft);
+                    break;
+
+                default:
+                    break;
+                }
+            }
+
+            @Override
+            public void gotData(String k, int flag, byte[] data) {
+                if (log.isDebugEnabled() && client.getPool().getEVCacheClientPoolManager().shouldLog(appName)) log.debug("Read data : key " + k + "; flags : " + flag + "; data : " + data);
+                if (isWrongKeyReturned(key, k)) return;
+
+                if (data != null)  {
+                    if (log.isDebugEnabled() && client.getPool().getEVCacheClientPoolManager().shouldLog(appName)) log.debug("Key : " + k + "; val size : " + data.length);
+                    getDataSizeDistributionSummary(EVCacheMetricsFactory.META_GET_OPERATION, EVCacheMetricsFactory.READ, EVCacheMetricsFactory.IPC_SIZE_INBOUND).record(data.length);
+                    if (tc == null) {
+                        if (tcService == null) {
+                            log.error("tcService is null, will not be able to decode");
+                            throw new RuntimeException("TranscoderSevice is null. Not able to decode");
+                        } else {
+                            final Transcoder<T> t = (Transcoder<T>) getTranscoder();
+                            final T item = t.decode(new CachedData(flag, data, t.getMaxSize()));
+                            evItem.setData(item);
+                        }
+                    } else {
+                        if (tcService == null) {
+                            log.error("tcService is null, will not be able to decode");
+                            throw new RuntimeException("TranscoderSevice is null. Not able to decode");
+                        } else {
+                            final T item = tc.decode(new CachedData(flag, data, tc.getMaxSize()));
+                            evItem.setData(item);
+                        }
+                    }
+                } else {
+                    if (log.isDebugEnabled() && client.getPool().getEVCacheClientPoolManager().shouldLog(appName)) log.debug("Key : " + k + "; val is null" );
+                }
+            }
+
+            public void complete() {
+                latch.countDown();
+                final String host = ((rv.getStatus().getStatusCode().equals(StatusCode.TIMEDOUT) && rv.getOperation() != null) ? getHostName(rv.getOperation().getHandlingNode().getSocketAddress()) : null);
+                getTimer(EVCacheMetricsFactory.META_GET_OPERATION, EVCacheMetricsFactory.READ, rv.getStatus(), (evItem.getData() != null ? EVCacheMetricsFactory.YES : EVCacheMetricsFactory.NO), host, getReadMetricMaxValue()).record((System.currentTimeMillis() - rv.getStartTime()), TimeUnit.MILLISECONDS);
+                rv.signalComplete();
+            }
+
+            });
+            rv.setOperation(op);
+            mconn.enqueueOperation(key, op);
+            if (log.isDebugEnabled()) log.debug("Meta_Get Data : " + rv);
+        }
+        return rv;
+    }
+}
